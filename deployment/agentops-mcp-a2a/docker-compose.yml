@@ -1,0 +1,258 @@
+name: agentops-mcp-a2a
+
+services:
+  # Persistent identity store. The init scripf creates separate databases
+  # and least-privilege users for Keycloak and AgentOps audit/catalog data.
+  postgres:
+    image: postgres:18.7-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD:?Set KC_DB_PASSWORD in .env}
+      AGENTOPS_DB_PASSWORD: ${AGENTOPS_DB_PASSWORD:?Set AGENTOPS_DB_PASSWORD in .env}
+    volumes:
+      # PostgreSQL 18 changed the recommended volume mount target.
+      - postgres_data:/var/lib/postgresql
+      - ./config/postgres/01-init-databases.sh:/docker-entrypoint-initdb.d/01-init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [agentops]
+    security_opt:
+      - no-new-privileges:true
+
+  # Development mode is intentionally used here. Production must use
+  # Keycloak's optimized `start` image, HTTPS and an externally managed hostname.
+  keycloak:
+    image: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:latest}
+    command:
+      - start-dev
+      - --http-enabled=true
+      - --hostname-strict=false
+      - --health-enabled=true
+      - --metrics-enabled=true
+    restart: unless-stopped
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?Set KEYCLOAK_ADMIN_PASSWORD in .env}
+      KC_DB: postgres
+      KC_DB_URL_HOST: postgres
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD:?Set KC_DB_PASSWORD in .env}
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [agentops]
+    security_opt:
+      - no-new-privileges:true
+
+  # Policy decision point. Policies are mounted read-only; no public port.
+  opa:
+    image: openpolicyagent/opa:1.22.4
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - --log-format=json
+      - --set=decision_logs.console=true
+      - /policies
+    restart: unless-stopped
+    volumes:
+      - ./config/opa:/policies:ro
+    networks: [agentops]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: services/mcp/Dockerfile
+    image: agentops-mcp-server:0.1.0
+    restart: unless-stopped
+    init: true
+    environment:
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-http://localhost:8000/mcp}
+      MCP_ISSUER_URL: ${KEYCLOAK_ISSUER_URL:-http://localhost:8080/realms/agentops}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-localhost:8000,127.0.0.1:8000}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+      KEYCLOAK_INTROSPECTION_URL: ${KEYCLOAK_INTROSPECTION_URL:-http://keycloak:8080/realms/agentops/protocol/openid-connect/token/introspect}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_RESOURCE_CLIENT_ID:-agentops-resource-server}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_RESOURCE_CLIENT_SECRET:?Set KEYCLOAK_RESOURCE_CLIENT_SECRET in .env}
+      KEYCLOAK_EXPECTED_AUDIENCE: ${KEYCLOAK_EXPECTED_AUDIENCE:-agentops-resource-server}
+      OPA_URL: http://opa:8181/v1/data/agentops/authz/allow
+      AGENTOPS_DB_HOST: postgres
+      AGENTOPS_DB_PORT: "5432"
+      AGENTOPS_DB_NAME: agentops
+      AGENTOPS_DB_USER: agentops
+      AGENTOPS_DB_PASSWORD: ${AGENTOPS_DB_PASSWORD:?Set AGENTOPS_DB_PASSWORD in .env}
+      OTEL_SERVICE_NAME: agentops-mcp
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=local,service.namespace=agentops
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opa:
+        condition: service_started
+      keycloak:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    networks: [agentops]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8000),timeout=2); s.close()"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+
+  a2a-agent:
+    build:
+      context: .
+      dockerfile: services/a2a/Dockerfile
+    image: agentops-a2a-agent:0.1.0
+    restart: unless-stopped
+    init: true
+    environment:
+      A2A_PUBLIC_URL: ${A2A_PUBLIC_URL:-http://localhost:9001/}
+      A2A_ALLOWED_ORIGINS: ${A2A_ALLOWED_ORIGINS:-http://localhost:9001,http://127.0.0.1:9001}
+      KEYCLOAK_INTROSPECTION_URL: ${KEYCLOAK_INTROSPECTION_URL:-http://keycloak:8080/realms/agentops/protocol/openid-connect/token/introspect}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_RESOURCE_CLIENT_ID:-agentops-resource-server}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_RESOURCE_CLIENT_SECRET:?Set KEYCLOAK_RESOURCE_CLIENT_SECRET in .env}
+      KEYCLOAK_EXPECTED_AUDIENCE: ${KEYCLOAK_EXPECTED_AUDIENCE:-agentops-resource-server}
+      OPA_URL: http://opa:8181/v1/data/agentops/authz/allow
+      AGENTOPS_DB_HOST: postgres
+      AGENTOPS_DB_PORT: "5432"
+      AGENTOPS_DB_NAME: agentops
+      AGENTOPS_DB_USER: agentops
+      AGENTOPS_DB_PASSWORD: ${AGENTOPS_DB_PASSWORD:?Set AGENTOPS_DB_PASSWORD in .env}
+      OTEL_SERVICE_NAME: agentops-a2a
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=local,service.namespace=agentops
+    ports:
+      - "127.0.0.1:9001:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opa:
+        condition: service_started
+      keycloak:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    networks: [agentops]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz',timeout=2).read()"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+
+  # OpenTelemetry receives OTLP from both agents, exports traces to Jaeger,
+  # and exposes an in-process Prometheus exporter for scraping.
+  otel-collector:
+    image: ${OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib:latest}
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    restart: unless-stopped
+    volumes:
+      - ./config/otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      jaeger:
+        condition: service_started
+    networks: [agentops]
+    security_opt:
+      - no-new-privileges:true
+
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:16686:16686"
+    networks: [agentops]
+    security_opt:
+      - no-new-privileges:true
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:latest}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    restart: unless-stopped
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - otel-collector
+    networks: [agentops]
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:latest}
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    networks: [agentops]
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  agentops:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:

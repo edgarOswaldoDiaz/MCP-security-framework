@@ -1,0 +1,10 @@
+# Exclude local secrets, repository metadata and build artifacts from Docker context.
+.env
+.git
+.gitignore
+.dockerignore
+**/__pycache__
+**/*.py[cod]
+.venv
+venv
+*.log
